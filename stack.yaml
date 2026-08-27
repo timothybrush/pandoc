@@ -25,7 +25,6 @@ extra-deps:
 - citeproc-0.13.0.1
 - skylighting-format-blaze-html-0.1.2.1
 - typst-symbols-0.3
-- texmath-0.13.2.1
 - git: https://github.com/jgm/djoths.git
   commit: 1aa9850accad90b8efdcaaab72f68d445ed1d7ab
 - git: https://github.com/jgm/asciidoc-hs.git
