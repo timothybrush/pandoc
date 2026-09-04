@@ -213,7 +213,7 @@ htmlAttrs (ident, classes, kvs) = addSpaceIfNotEmpty (hsep [
   ])
  where
    formatKey x = text . T.unpack $
-        if (x `Set.member` (html5Attributes <> rdfaAttributes)
+        if ((x `Set.member` html5Attributes || x `Set.member` rdfaAttributes)
             && x /= "label") -- #10048
              || T.any (== ':') x -- e.g. epub: namespace
              || "data-" `T.isPrefixOf` x
@@ -608,8 +608,8 @@ gridRow opts blocksToDoc = mapM renderCell
 lookupMetaBool :: Text -> Meta -> Bool
 lookupMetaBool key meta =
   case lookupMeta key meta of
-      Just (MetaBlocks _)  -> True
-      Just (MetaInlines _) -> True
+      Just (MetaBlocks bs)  -> not (null bs)
+      Just (MetaInlines ils) -> not (null ils)
       Just (MetaString x)  -> not (T.null x)
       Just (MetaBool True) -> True
       _                    -> False
@@ -800,8 +800,9 @@ splitSentences = go . toList
   isSentenceEnding t =
     case T.unsnoc t of
       Just (t',c)
-        | c == '.' || c == '!' || c == '?'
+        | c == '.'
         , not (isInitial t') -> True
+        | c == '!' || c == '?' -> True
         | c == ')' || c == ']' || c == '"' || c == '\x201D' ->
            case T.unsnoc t' of
              Just (t'',d) -> d == '.' || d == '!' || d == '?' &&
