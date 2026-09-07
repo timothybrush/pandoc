@@ -204,10 +204,11 @@ htmlAttrs :: HasChars a => Attr -> Doc a
 htmlAttrs (ident, classes, kvs) = addSpaceIfNotEmpty (hsep [
   if T.null ident
       then empty
-      else "id=" <> doubleQuotes (text $ T.unpack ident)
+      else "id=" <> doubleQuotes (text $ T.unpack (escapeStringForXML ident))
   ,if null classes
       then empty
-      else "class=" <> doubleQuotes (text $ T.unpack (T.unwords classes))
+      else "class=" <> doubleQuotes
+             (text $ T.unpack . escapeStringForXML $ T.unwords classes)
   ,hsep (map (\(k,v) -> formatKey k <> "=" <>
                 doubleQuotes (text $ T.unpack (escapeStringForXML v))) kvs)
   ])
@@ -260,8 +261,8 @@ isDisplayMath _                             = False
 -- | Remove leading and trailing 'Space' and 'SoftBreak' elements.
 stripLeadingTrailingSpace :: [Inline] -> [Inline]
 stripLeadingTrailingSpace = go . reverse . go . reverse
-  where go (Space:xs)     = xs
-        go (SoftBreak:xs) = xs
+  where go (Space:xs)     = go xs
+        go (SoftBreak:xs) = go xs
         go xs             = xs
 
 -- | Put display math in its own block (for ODT/DOCX).
@@ -678,6 +679,7 @@ toSubscript '-' = Just '\x208B'
 toSubscript '=' = Just '\x208C'
 toSubscript '(' = Just '\x208D'
 toSubscript ')' = Just '\x208E'
+toSubscript '\x2212' = Just '\x208B' -- unicode minus
 toSubscript c
   | c >= '0' && c <= '9' =
                  Just $ chr (0x2080 + (ord c - 48))
@@ -805,8 +807,8 @@ splitSentences = go . toList
         | c == '!' || c == '?' -> True
         | c == ')' || c == ']' || c == '"' || c == '\x201D' ->
            case T.unsnoc t' of
-             Just (t'',d) -> d == '.' || d == '!' || d == '?' &&
-                             not (isInitial t'')
+             Just (t'',d) -> (d == '.' && not (isInitial t''))
+                               || d == '!' || d == '?'
              _ -> False
       _ -> False
    where
