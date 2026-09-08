@@ -363,17 +363,18 @@ blockToTypst block =
                 $$ footer
             )
             $$ ")"
-      return $ if "typst:no-figure" `elem` tabclasses
-        then toTypstBracesSetText typstTextAttrs table
-        else "#figure("
-            $$
-            nest 2
-            ("align(center)[" <> toTypstPoundSetText typstTextAttrs <> "#" <> table <> "]"
-              $$ capt'
-              $$ typstFigureKind
-              $$ ")")
-            $$ lab
-          $$ blankline
+      return $
+        (if "typst:no-figure" `elem` tabclasses
+            then toTypstBracesSetText typstTextAttrs table
+            else "#figure("
+                 $$
+                 nest 2
+                 ("align(center)[" <> toTypstPoundSetText typstTextAttrs <> "#" <> table <> "]"
+                   $$ capt'
+                   $$ typstFigureKind
+                   $$ ")"))
+        $$ lab
+        $$ blankline
     Figure (ident,_,kvs) (Caption _mbshort capt) blocks -> do
       caption <- blocksToTypst capt
       opts <-  gets stOptions

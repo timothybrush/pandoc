@@ -139,6 +139,7 @@ import Text.Pandoc.Error
 import Text.Pandoc.Parsing.Capabilities
 import Text.Pandoc.Parsing.State
 import Text.Pandoc.Parsing.Future (Future (..))
+import qualified Data.Map as M
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Text.Pandoc.Builder as B
@@ -308,12 +309,14 @@ oneOfStringsCI :: (Stream s m Char, UpdateSourcePos s Char)
                => [Text] -> ParsecT s st m Text
 oneOfStringsCI = oneOfStrings' ciMatch
   where ciMatch x y = toLower' x == toLower' y
-        -- this optimizes toLower by checking common ASCII case
-        -- first, before calling the expensive unicode-aware
-        -- function:
-        toLower' c | isAsciiUpper c = chr (ord c + 32)
-                   | isAscii c = c
-                   | otherwise = toLower c
+
+-- | Optimized 'toLower': checks the common ASCII case
+-- first, before calling the expensive unicode-aware
+-- function.
+toLower' :: Char -> Char
+toLower' c | isAsciiUpper c = chr (ord c + 32)
+           | isAscii c = c
+           | otherwise = toLower c
 
 -- | Parses a space or tab.
 spaceChar :: (Stream s m Char, UpdateSourcePos s Char)
@@ -483,11 +486,36 @@ emailAddress = try $ toResult <$> mailbox <*> (char '@' *> domain)
 emailPunctChars :: Set.Set Char
 emailPunctChars = Set.fromList "!\"#$%&'*+-/=?^_{|}~;"
 
-uriScheme :: (Stream s m Char, UpdateSourcePos s Char) => ParsecT s st m Text
-uriScheme = oneOfStringsCI schemeList
+-- | Trie over 'Char', used for efficient matching against the
+-- (large, static) set of known URI schemes.
+data CharTrie = CharTrie !Bool !(M.Map Char CharTrie)
 
-schemeList :: [Text]
-schemeList = Set.toList schemes
+trieInsert :: Text -> CharTrie -> CharTrie
+trieInsert t (CharTrie terminal m) =
+  case T.uncons t of
+    Nothing -> CharTrie True m
+    Just (c, rest) -> CharTrie terminal $
+      M.alter (Just . trieInsert rest . fromMaybe (CharTrie False mempty)) c m
+
+-- | Trie of known URI schemes; keys are case-folded with 'toLower''.
+schemeTrie :: CharTrie
+schemeTrie = foldr trieInsert (CharTrie False mempty)
+                   (map (T.map toLower') (Set.toList schemes))
+
+-- | Parses a known URI scheme, case-insensitively, preferring the
+-- longest matching scheme.  Returns the scheme as written in the input.
+uriScheme :: (Stream s m Char, UpdateSourcePos s Char) => ParsecT s st m Text
+uriScheme = TL.toStrict . TB.toLazyText <$> try (go mempty schemeTrie)
+ where
+  go acc (CharTrie _ m) = do
+    c <- anyChar
+    case M.lookup (toLower' c) m of
+      Nothing -> Prelude.fail "not a URI scheme"
+      Just subtrie@(CharTrie terminal _) ->
+        let !acc' = acc <> TB.singleton c
+        in if terminal
+              then option acc' (try (go acc' subtrie))
+              else go acc' subtrie
 
 -- | Parses a URI. Returns pair of original and URI-escaped version.
 uri :: (Stream s m Char, UpdateSourcePos s Char) => ParsecT s st m (Text, Text)
