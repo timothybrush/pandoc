@@ -64,7 +64,6 @@ where
 
 import Control.Monad
   ( join
-  , liftM
   , unless
   , void
   , when
@@ -129,8 +128,6 @@ import Text.Parsec
   , setInput
   , setPosition
   , skipMany
-  , sourceColumn
-  , sourceName
   , tokenPrim
   , try
   , unexpected
@@ -151,7 +148,7 @@ import qualified Data.Bifunctor as Bifunctor
 -- | Remove whitespace from start and end; just like @'trimInlines'@,
 -- but lifted into the 'Future' type.
 trimInlinesF :: Future s Inlines -> Future s Inlines
-trimInlinesF = liftM trimInlines
+trimInlinesF = fmap trimInlines
 
 -- | Like @count@, but packs its result
 countChar :: (Stream s m Char, UpdateSourcePos s Char, Monad m)
@@ -356,7 +353,7 @@ gobbleSpaces :: (HasReaderOptions st, Monad m)
              => Int -> ParsecT Sources st m ()
 gobbleSpaces 0 = return ()
 gobbleSpaces n
-  | n < 0     = error "gobbleSpaces called with negative number"
+  | n < 0     = Prelude.fail "gobbleSpaces called with negative number"
   | otherwise = try $ do
       char ' ' <|> eatOneSpaceOfTab
       gobbleSpaces (n - 1)
@@ -369,12 +366,11 @@ eatOneSpaceOfTab = do
   -- replace the tab on the input stream with spaces
   let numSpaces = tabstop - ((sourceColumn pos - 1) `mod` tabstop)
   inp <- getInput
-  setInput $
-    case inp of
-      Sources [] -> error "eatOneSpaceOfTab - empty Sources list"
-      Sources ((fp,t):rest) ->
-        -- drop the tab and add spaces
-        Sources ((fp, T.replicate numSpaces " " <> T.drop 1 t):rest)
+  case inp of
+    Sources [] -> Prelude.fail "eatOneSpaceOfTab - empty Sources list"
+    Sources ((fp,t):rest) -> setInput $
+      -- drop the tab and add spaces
+      Sources ((fp, T.replicate numSpaces " " <> T.drop 1 t):rest)
   char ' '
 
 -- | Gobble up to n spaces; if tabs are encountered, expand them
@@ -383,7 +379,7 @@ gobbleAtMostSpaces :: (HasReaderOptions st, Monad m)
                    => Int -> ParsecT Sources st m Int
 gobbleAtMostSpaces 0 = return 0
 gobbleAtMostSpaces n
-  | n < 0     = error "gobbleAtMostSpaces called with negative number"
+  | n < 0     = Prelude.fail "gobbleAtMostSpaces called with negative number"
   | otherwise = option 0 $ do
       char ' ' <|> eatOneSpaceOfTab
       (+ 1) <$> gobbleAtMostSpaces (n - 1)
@@ -664,8 +660,7 @@ registerHeader (ident,classes,kvs) header' = do
        let id'' = if Ext_ascii_identifiers `extensionEnabled` exts
                      then toAsciiText id'
                      else id'
-       updateState $ updateIdentifierList $ Set.insert id'
-       updateState $ updateIdentifierList $ Set.insert id''
+       updateState $ updateIdentifierList (Set.insert id' . Set.insert id'')
        return (id'',classes,kvs)
      else do
         unless (T.null ident) $ do
