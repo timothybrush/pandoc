@@ -24,6 +24,7 @@ module Text.Pandoc.Readers.LaTeX ( readLaTeX,
 import Control.Applicative (many, optional, (<|>))
 import Control.Monad
 import Control.Monad.Except (throwError)
+import Control.Monad.Reader (runReaderT)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Char (isDigit, isLetter, isAlphaNum, toUpper, chr)
 import Data.Default
@@ -87,11 +88,21 @@ readLaTeX :: (PandocMonad m, ToSources a)
           -> m Pandoc
 readLaTeX opts ltx = do
   let sources = toSources ltx
-  parsed <- runParserT parseLaTeX def{ sOptions = opts } "source"
+  parsed <- flip runReaderT latexEnv $
+               runParserT parseLaTeX def{ sOptions = opts } "source"
                (TokStream False (tokenizeSources sources))
   case parsed of
     Right result -> return result
     Left e       -> throwError $ fromParsecError sources e
+
+-- | The command dispatch tables, built once per parse and shared
+-- through the reader environment (see 'LaTeXEnv').
+latexEnv :: PandocMonad m => LaTeXEnv m
+latexEnv = LaTeXEnv
+  { envInlineCommands = inlineCommands
+  , envBlockCommands  = blockCommands
+  , envEnvironments   = environments
+  }
 
 parseLaTeX :: PandocMonad m => LP m Pandoc
 parseLaTeX = do
@@ -156,7 +167,7 @@ rawLaTeXBlock = do
   lookAhead (try (char '\\' >> letter))
   toks <- getInputTokens
   snd <$> (
-          rawLaTeXParser toks
+          rawLaTeXParser latexEnv toks
              (makeAtLetterSection <|>
               macroDef (const mempty) <|>
               do choice (map controlSeq
@@ -164,7 +175,7 @@ rawLaTeXBlock = do
                  skipMany opt
                  braced
                  return mempty) blocks
-      <|> rawLaTeXParser toks
+      <|> rawLaTeXParser latexEnv toks
            (void (environment <|> blockCommand))
            (mconcat <$> many (block <|> beginOrEndCommand)))
 
@@ -199,10 +210,10 @@ rawLaTeXInline = do
   lookAhead (try (char '\\' >> letter))
   toks <- getInputTokens
   raw <- snd <$>
-          (   rawLaTeXParser toks
+          (   rawLaTeXParser latexEnv toks
               (mempty <$ (controlSeq "input" >> skipMany rawopt >> braced))
               inlines
-          <|> rawLaTeXParser toks (void inline) inlines
+          <|> rawLaTeXParser latexEnv toks (void inline) inlines
           )
   finalbraces <- mconcat <$> many (try (string "{}")) -- see #5439
   return $ raw <> T.pack finalbraces
@@ -211,7 +222,8 @@ inlineCommand :: PandocMonad m => ParsecT Sources ParserState m Inlines
 inlineCommand = do
   lookAhead (try (char '\\' >> letter))
   toks <- getInputTokens
-  fst <$> rawLaTeXParser toks (void (inlineEnvironment <|> inlineCommand'))
+  fst <$> rawLaTeXParser latexEnv toks
+          (void (inlineEnvironment <|> inlineCommand'))
           inlines
 
 -- inline elements:
@@ -337,21 +349,23 @@ inlineCommand' = try $ do
        rawcommand <- getRawCommand name (cmd <> star)
        (guardEnabled Ext_raw_tex >> return (rawInline "latex" rawcommand))
          <|> ignore rawcommand
-  lookupListDefault raw names inlineCommands
+  commandMap <- envInlineCommands <$> askEnv
+  lookupListDefault raw names commandMap
 
 tok :: PandocMonad m => LP m Inlines
 tok = tokWith inline
 
 unescapeURL :: Text -> Text
-unescapeURL = T.concat . go . T.splitOn "\\"
-  where
-    isEscapable c = T.any (== c) "#$%&~_^\\{}"
-    go (x:xs) = x : map unescapeInterior xs
-    go []     = []
-    unescapeInterior t
-      | Just (c, _) <- T.uncons t
-      , isEscapable c = t
-      | otherwise = "\\" <> t
+unescapeURL t =
+  let (xs, ys) = T.break (== '\\') t
+  in case T.uncons ys of
+       Nothing -> xs
+       Just (_, rest) ->
+         case T.uncons rest of
+           Just (c, rest')
+             | isEscapable c -> xs <> T.cons c (unescapeURL rest')
+           _ -> xs <> "\\" <> unescapeURL rest
+  where isEscapable c = T.any (== c) "#$%&~_^\\{}"
 
 inlineCommands :: PandocMonad m => M.Map Text (LP m Inlines)
 inlineCommands = M.unions
@@ -808,13 +822,16 @@ inline = do
                 -> eatOneToken *>
                     option (str "-") (symbol '-' *>
                       option (str "–") (str "—" <$ symbol '-'))
-        "'"     -> eatOneToken *>
-                    option (str "’") (str  "”" <$ (guard ligatures *> symbol '\''))
+        "'" | ligatures
+                -> eatOneToken *>
+                    option (str "’") (str "”" <$ symbol '\'')
+            | otherwise
+                -> symbolAsString
         "~"     -> str "\160" <$ eatOneToken
         "`" | ligatures
                 -> doubleQuote <|> singleQuote <|> (str "‘" <$ symbol '`')
             | otherwise
-                -> str "‘" <$ symbol '`'
+                -> symbolAsString
         "\"" | ligatures
                 -> doubleQuote <|> singleQuote <|> symbolAsString
         "“"     -> doubleQuote <|> symbolAsString
@@ -844,13 +861,10 @@ inlines = mconcat <$> many inline
 opt :: PandocMonad m => LP m Inlines
 opt = do
   toks <- try (sp *> bracketedToks <* sp)
-  -- now parse the toks as inlines
-  st <- getState
-  parsed <- runParserT (mconcat <$> many inline) st "bracketed option"
-              (TokStream False toks)
-  case parsed of
-    Right result -> return result
-    Left e       -> throwError $ fromParsecError (toSources toks) e
+  -- now parse the toks as inlines; parseFromToks preserves any
+  -- state changes (e.g. macro definitions), since an optional
+  -- argument is not a TeX group
+  parseFromToks (mconcat <$> many inline) toks
 
 -- block elements:
 
@@ -1049,7 +1063,8 @@ blockCommand = try $ do
         lookAhead $ blankline <|> startCommand
         return $ curr <> mconcat rest
   let raw = rawDefiniteBlock <|> rawMaybeBlock
-  lookupListDefault raw names blockCommands
+  commandMap <- envBlockCommands <$> askEnv
+  lookupListDefault raw names commandMap
 
 closing :: PandocMonad m => LP m Blocks
 closing = do
@@ -1278,7 +1293,8 @@ environment :: PandocMonad m => LP m Blocks
 environment = try $ do
   controlSeq "begin"
   name <- untokenize <$> braced
-  M.findWithDefault mzero name environments <|>
+  envMap <- envEnvironments <$> askEnv
+  M.findWithDefault mzero name envMap <|>
     langEnvironment name <|>
     theoremEnvironment blocks inlines opt name <|>
     if M.member name (inlineEnvironments

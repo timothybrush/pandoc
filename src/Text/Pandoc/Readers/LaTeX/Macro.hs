@@ -12,8 +12,10 @@ import Text.Pandoc.Shared (safeRead)
 import Text.Pandoc.Parsing hiding (blankline, mathDisplay, mathInline,
                             optional, space, spaces, withRaw, (<|>))
 import Control.Applicative ((<|>), optional)
+import Control.Monad (guard)
 import Data.Char (chr, isLetter, ord)
 import qualified Data.Map as M
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.List.NonEmpty as NonEmpty
@@ -21,6 +23,10 @@ import Data.List.NonEmpty (NonEmpty(..))
 
 macroDef :: (PandocMonad m, Monoid a) => (Text -> a) -> LP m a
 macroDef constructor = do
+    Tok _ (CtrlSeq name) _ <- peekTok
+    -- fail quickly, before trying each alternative in turn, unless
+    -- the next token can begin a macro definition:
+    guard $ name `Set.member` macroDefCommands
     (_, s) <- withRaw (commandDef <|> environmentDef)
     (constructor (untokenize s) <$
       guardDisabled Ext_latex_macros)
@@ -43,6 +49,26 @@ macroDef constructor = do
         -- is equivalent to
         -- @\newcommand{\envname}[n-args][default]{begin}@
         -- @\newcommand{\endenvname}@
+
+-- | Control sequences that can begin a macro definition.  This
+-- must include every control sequence that one of the parsers
+-- used in 'macroDef' can start with.
+macroDefCommands :: Set.Set Text
+macroDefCommands = Set.fromList
+  [ "global"  -- see checkGlobal
+  , "let", "edef", "xdef", "def", "gdef", "newif"
+  , "newcommand", "renewcommand", "providecommand"
+  , "DeclareMathOperator", "DeclareRobustCommand"
+  , "NewDocumentCommand", "RenewDocumentCommand"
+  , "ProvideDocumentCommand", "DeclareDocumentCommand"
+  , "NewExpandableDocumentCommand", "RenewExpandableDocumentCommand"
+  , "ProvideExpandableDocumentCommand", "DeclareExpandableDocumentCommand"
+  , "NewDocumentEnvironment", "RenewDocumentEnvironment"
+  , "ProvideDocumentEnvironment", "DeclareDocumentEnvironment"
+  , "NewCommandCopy", "RenewCommandCopy", "DeclareCommandCopy"
+  , "NewEnvironmentCopy", "RenewEnvironmentCopy", "DeclareEnvironmentCopy"
+  , "newenvironment", "renewenvironment", "provideenvironment"
+  ]
 
 insertMacro :: PandocMonad m => (Text, Macro) -> LP m ()
 insertMacro (name, macro'@(Macro GlobalScope _ _ _ _)) =
@@ -118,10 +144,11 @@ defmacro = do
 -- \footrue to be a command that defines \iffoo to be \iftrue
 -- \foofalse to be a command that defines \iffoo to be \iffalse
 newif :: PandocMonad m => LP m [(Text, Macro)]
-newif = do
+newif = try $ do
   controlSeq "newif"
   withVerbatimMode $ do
     Tok pos (CtrlSeq name) _ <- anyControlSeq
+    guard $ "if" `T.isPrefixOf` name
     -- \def\iffoo\iffalse
     -- \def\footrue{\def\iffoo\iftrue}
     -- \def\foofalse{\def\iffoo\iffalse}

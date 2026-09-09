@@ -268,7 +268,7 @@ charCommands = M.fromList
   , ("{", lit "{")
   , ("}", lit "}")
   , ("-", lit "\x00ad") -- soft hyphen
-  , ("qed", lit "\a0\x25FB")
+  , ("qed", lit "\xa0\x25FB")
   , ("lq", return (str "‘"))
   , ("rq", return (str "’"))
   , ("textquoteleft", return (str "‘"))

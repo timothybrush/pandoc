@@ -25,6 +25,9 @@ module Text.Pandoc.Readers.LaTeX.Parsing
   , LaTeXState(..)
   , defaultLaTeXState
   , LP
+  , LaTeXEnv(..)
+  , emptyLaTeXEnv
+  , askEnv
   , TokStream(..)
   , withVerbatimMode
   , rawLaTeXParser
@@ -98,12 +101,12 @@ module Text.Pandoc.Readers.LaTeX.Parsing
 import Control.Applicative (many, (<|>))
 import Control.Monad
 import Control.Monad.Except (throwError)
+import Control.Monad.Reader (ReaderT, ask, runReaderT)
 import Control.Monad.Trans (lift)
 import Data.Char (chr, isAlphaNum, isDigit, isLetter, ord)
 import Data.Default
 import Data.List (dropWhileEnd, intercalate, isSuffixOf, unfoldr)
 import Numeric (showEFloat, showFFloat)
-import qualified Data.IntMap as IntMap
 import qualified Data.Map as M
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -114,7 +117,7 @@ import qualified Data.Text as T
 import Text.Pandoc.Builder
 import Text.Pandoc.Class.PandocMonad (PandocMonad, report)
 import Text.Pandoc.Error
-         (PandocError (PandocMacroLoop,PandocShouldNeverHappenError))
+         (PandocError (PandocMacroLoop))
 import Text.Pandoc.Logging
 import Text.Pandoc.Options
 import Text.Pandoc.Parsing hiding (blankline, many, mathDisplay, mathInline,
@@ -176,7 +179,14 @@ data LaTeXState = LaTeXState{ sOptions       :: ReaderOptions
                             , sToggles       :: M.Map Text Bool
                             , sFileContents  :: M.Map Text Text
                             , sEnableWithRaw :: Bool
-                            , sRawTokens     :: IntMap.IntMap [Tok]
+                            , sRawTokens     :: [Tok]
+                              -- ^ reversed list of tokens consumed
+                              -- while at least one withRaw scope is
+                              -- active
+                            , sRawTokenCount :: !Int
+                              -- ^ length of sRawTokens
+                            , sRawScopes     :: !Int
+                              -- ^ number of active withRaw scopes
                             , sLigatures     :: Bool
                             , sCaseExclusions :: M.Map Text (Set.Set Text)
                               -- ^ words excluded from case changing
@@ -210,7 +220,9 @@ defaultLaTeXState = LaTeXState{ sOptions       = def
                               , sToggles       = M.empty
                               , sFileContents  = M.empty
                               , sEnableWithRaw = True
-                              , sRawTokens     = IntMap.empty
+                              , sRawTokens     = []
+                              , sRawTokenCount = 0
+                              , sRawScopes     = 0
                               , sLigatures     = True
                               , sCaseExclusions = M.empty
                               }
@@ -273,7 +285,26 @@ instance Monad m => Stream TokStream m Tok where
   uncons (TokStream _ []) = return Nothing
   uncons (TokStream _ (t:ts)) = return $ Just (t, TokStream False ts)
 
-type LP m = ParsecT TokStream LaTeXState m
+type LP m = ParsecT TokStream LaTeXState (ReaderT (LaTeXEnv m) m)
+
+-- | Environment holding the command dispatch tables.  Because these
+-- tables have types that mention the parser monad, they cannot be
+-- top-level constants; passing them in a reader environment ensures
+-- they are constructed once per parse rather than once per use.
+data LaTeXEnv m = LaTeXEnv
+  { envInlineCommands :: M.Map Text (LP m Inlines)
+  , envBlockCommands  :: M.Map Text (LP m Blocks)
+  , envEnvironments   :: M.Map Text (LP m Blocks)
+  }
+
+-- | An environment with empty dispatch tables, for running parsers
+-- that do not consult them.
+emptyLaTeXEnv :: LaTeXEnv m
+emptyLaTeXEnv = LaTeXEnv mempty mempty mempty
+
+-- | Retrieve the command dispatch tables.
+askEnv :: Monad m => LP m (LaTeXEnv m)
+askEnv = lift ask
 
 withVerbatimMode :: PandocMonad m => LP m a -> LP m a
 withVerbatimMode parser = do
@@ -287,9 +318,9 @@ withVerbatimMode parser = do
        return result
 
 rawLaTeXParser :: (PandocMonad m, HasMacros s, HasReaderOptions s, Show a)
-               => [Tok] -> LP m () -> LP m a
+               => LaTeXEnv m -> [Tok] -> LP m () -> LP m a
                -> ParsecT Sources s m (a, Text)
-rawLaTeXParser toks parser valParser = do
+rawLaTeXParser lenv toks parser valParser = do
   pstate <- getState
   let lstate = def{ sOptions = extractReaderOptions pstate }
   let lstate' = lstate { sMacros = extractMacros pstate :| [] }
@@ -298,12 +329,14 @@ rawLaTeXParser toks parser valParser = do
                       _ -> return ()
   let preparser = setStartPos >> parser
   let rawparser = (,) <$> withRaw valParser <*> getState
-  res' <- lift $ runParserT (withRaw (preparser >> getPosition))
+  res' <- lift $ flip runReaderT lenv $
+                 runParserT (withRaw (preparser >> getPosition))
                             lstate "chunk" $ TokStream False toks
   case res' of
        Left _    -> mzero
        Right (endpos, toks') -> do
-         res <- lift $ runParserT rawparser lstate' "chunk"
+         res <- lift $ flip runReaderT lenv $
+                       runParserT rawparser lstate' "chunk"
                      $ TokStream False toks'
          case res of
               Left _    -> mzero
@@ -334,7 +367,8 @@ applyMacros s = (guardDisabled Ext_latex_macros >> return s) <|>
       pstate <- getState
       let lstate = def{ sOptions = extractReaderOptions pstate
                       , sMacros  = extractMacros pstate :| [] }
-      res <- runParserT retokenize lstate "math" $
+      res <- flip runReaderT emptyLaTeXEnv $
+                 runParserT retokenize lstate "math" $
                  TokStream False (tokenize (initialPos "math") s)
       case res of
            Left e   -> Prelude.fail (show e)
@@ -440,7 +474,7 @@ tokenize = totoks (TokenizerState False False)
                               (incSourceColumn pos (2 + T.length t1)) t2
                         Nothing -> Tok pos Symbol "#"
                                   : Tok (incSourceColumn pos 1) Symbol "#"
-                                  : totoks atIsLetter (incSourceColumn pos 1) t3
+                                  : totoks atIsLetter (incSourceColumn pos 2) t3
              _ ->
                let (t1, t2) = T.span (\d -> d >= '0' && d <= '9') rest
                in  case safeRead t1 of
@@ -505,21 +539,23 @@ isLowerHex :: Char -> Bool
 isLowerHex x = x >= '0' && x <= '9' || x >= 'a' && x <= 'f'
 
 untokenize :: [Tok] -> Text
-untokenize = foldr untokenAccum mempty
-
-untokenAccum :: Tok -> Text -> Text
-untokenAccum (Tok _ (CtrlSeq _) t) accum =
-  -- insert space to prevent breaking a control sequence; see #5836
-  case (T.unsnoc t, T.uncons accum) of
-    (Just (_,c), Just (d,_))
-      | isLetter c
-      , isLetter d
-      -> t <> " " <> accum
-    _ -> t <> accum
-untokenAccum (Tok _ _ t) accum = t <> accum
+untokenize = T.concat . go
+  where
+    go [] = []
+    go (Tok _ (CtrlSeq _) t : ts)
+      -- insert space to prevent breaking a control sequence; see #5836
+      | Just (_, c) <- T.unsnoc t
+      , isLetter c
+      , nextStartsWithLetter ts = t : " " : go ts
+    go (Tok _ _ t : ts) = t : go ts
+    nextStartsWithLetter (Tok _ _ t : ts) =
+      case T.uncons t of
+        Just (d, _) -> isLetter d
+        Nothing     -> nextStartsWithLetter ts
+    nextStartsWithLetter [] = False
 
 untoken :: Tok -> Text
-untoken t = untokenAccum t mempty
+untoken (Tok _ _ t) = t
 
 parseFromToks :: PandocMonad m => LP m a -> [Tok] -> LP m a
 parseFromToks parser toks = do
@@ -529,11 +565,15 @@ parseFromToks parser toks = do
   case toks of
      Tok pos _ _ : _ -> setPosition pos
      _ -> return ()
-  -- we ignore existing raw tokens maps (see #9517)
-  oldRawTokens <- sRawTokens <$> getState
-  updateState $ \st -> st{ sRawTokens = mempty }
+  -- we ignore existing raw token accumulation (see #9517)
+  oldst <- getState
+  updateState $ \st -> st{ sRawTokens = []
+                         , sRawTokenCount = 0
+                         , sRawScopes = 0 }
   result <- parser
-  updateState $ \st -> st{ sRawTokens = oldRawTokens }
+  updateState $ \st -> st{ sRawTokens = sRawTokens oldst
+                         , sRawTokenCount = sRawTokenCount oldst
+                         , sRawScopes = sRawScopes oldst }
   setInput oldInput
   setPosition oldpos
   return result
@@ -551,10 +591,9 @@ satisfyTok f = do
     doMacros -- apply macros on remaining input stream
     res <- tokenPrim (T.unpack . untoken) updatePos matcher
     updateState $ \st ->
-      if sEnableWithRaw st
-         then
-           let !newraws = IntMap.map (res:) $! sRawTokens st
-            in  st{ sRawTokens = newraws }
+      if sRawScopes st > 0 && sEnableWithRaw st
+         then st{ sRawTokens = res : sRawTokens st
+                , sRawTokenCount = sRawTokenCount st + 1 }
          else st
     return $! res
   where matcher t | f t       = Just t
@@ -566,15 +605,24 @@ satisfyTok f = do
 peekTok :: PandocMonad m => LP m Tok
 peekTok = do
   doMacros
-  lookAhead (satisfyTok (const True))
+  TokStream _ toks <- getInput
+  case toks of
+    t : _ -> return t
+    []    -> mzero
 
 doMacros :: PandocMonad m => LP m ()
 doMacros = do
   TokStream macrosExpanded toks <- getInput
-  unless macrosExpanded $ do
-    st <- getState
-    unless (sVerbatimMode st) $
-      doMacros' 1 toks >>= setInput . TokStream True
+  unless macrosExpanded $
+    case toks of
+      -- only a control sequence at the head of the stream can
+      -- trigger macro expansion; in other cases we skip the
+      -- state update:
+      Tok _ (CtrlSeq _) _ : _ -> do
+        st <- getState
+        unless (sVerbatimMode st) $
+          doMacros' 1 toks >>= setInput . TokStream True
+      _ -> return ()
 
 doMacros' :: PandocMonad m => Int -> [Tok] -> LP m [Tok]
 doMacros' n inp =
@@ -762,11 +810,11 @@ trySpecialMacro "xspace" ts = do
     Tok pos Word t : _
       | startsWithAlphaNum t -> return $ Tok pos Spaces " " : ts'
     _ -> return ts'
-trySpecialMacro "iftrue" ts = handleIf (ifParser True) ts
-trySpecialMacro "iffalse" ts = handleIf (ifParser False) ts
+trySpecialMacro "iftrue" ts = doIf True ts
+trySpecialMacro "iffalse" ts = doIf False ts
 trySpecialMacro "ifmmode" ts = do
   mathMode <- sMathMode <$> getState
-  handleIf (ifParser mathMode) ts
+  doIf mathMode ts
 trySpecialMacro "ifstrequal" ts = do
   handleIf ifStrequalParser ts
 -- xparse (LaTeX3) argument conditionals:
@@ -909,14 +957,67 @@ handleIf parser ts = do
     Left _ -> Prelude.fail "Could not parse conditional"
     Right ts' -> return ts'
 
-ifParser :: PandocMonad m => Bool -> LP m [Tok]
-ifParser b = do
-  ifToks <- many (notFollowedBy (controlSeq "else" <|> controlSeq "fi")
-                    *> anyTok)
-  elseToks <- (controlSeq "else" >> manyTill anyTok (controlSeq "fi"))
-                 <|> ([] <$ controlSeq "fi")
-  TokStream _ rest <- getInput
-  return $ (if b then ifToks else elseToks) ++ rest
+-- | Names of TeX's primitive conditionals.  While scanning for the
+-- @\\else@ or @\\fi@ that ends a conditional branch, we need to
+-- know which control sequences begin a conditional, so that the
+-- @\\else@ and @\\fi@ belonging to nested conditionals are not
+-- mistaken for the end of the current one.
+primitiveConditionalNames :: Set.Set Text
+primitiveConditionalNames = Set.fromList
+  [ "if", "ifcase", "ifcat", "ifcsname", "ifdefined", "ifdim"
+  , "ifeof", "iffalse", "iffontchar", "ifhbox", "ifhmode"
+  , "ifincsname", "ifinner", "ifmmode", "ifnum", "ifodd", "iftrue"
+  , "ifvbox", "ifvmode", "ifvoid", "ifx" ]
+
+-- | Handle a conditional like @\\iftrue@: select the branch before
+-- @\\else@ (or @\\fi@) if the Bool is True, the else branch
+-- otherwise.  The unselected branch is skipped without expansion
+-- (as TeX does), keeping nested conditionals balanced.
+doIf :: PandocMonad m => Bool -> [Tok] -> LP m [Tok]
+doIf b ts = do
+  macros <- sMacros <$> getState
+  -- Conditionals defined with \newif (or \let from a primitive
+  -- conditional) expand to a single conditional token; TeX
+  -- recognizes these too when skipping conditional text.
+  let isConditionalMacro (Macro _ _ [] Nothing [Tok _ (CtrlSeq n) _]) =
+        n `Set.member` primitiveConditionalNames
+      isConditionalMacro _ = False
+  let conditionals = foldr
+        (\m s -> M.foldrWithKey
+           (\k v s' -> if isConditionalMacro v
+                          then Set.insert k s'
+                          else s')
+           s m)
+        primitiveConditionalNames macros
+  case splitConditional conditionals ts of
+    Just (ifToks, elseToks, rest) ->
+      return $ (if b then ifToks else elseToks) ++ rest
+    Nothing -> Prelude.fail "Could not parse conditional"
+
+-- | Split the tokens following a conditional into the tokens
+-- before @\\else@ (or @\\fi@), the tokens of the else branch (if
+-- any), and the tokens after the matching @\\fi@.  Returns Nothing
+-- if there is no matching @\\fi@.
+splitConditional :: Set.Set Text -> [Tok] -> Maybe ([Tok], [Tok], [Tok])
+splitConditional conditionals = goIf (0 :: Int) id
+ where
+  goIf _ _ [] = Nothing
+  goIf depth acc (t@(Tok _ (CtrlSeq name) _) : rest)
+    | name == "fi"
+    , depth == 0 = Just (acc [], [], rest)
+    | name == "fi" = goIf (depth - 1) (acc . (t:)) rest
+    | name == "else"
+    , depth == 0 = goElse (acc []) (0 :: Int) id rest
+    | name `Set.member` conditionals = goIf (depth + 1) (acc . (t:)) rest
+  goIf depth acc (t : rest) = goIf depth (acc . (t:)) rest
+  goElse _ _ _ [] = Nothing
+  goElse ifToks depth acc (t@(Tok _ (CtrlSeq name) _) : rest)
+    | name == "fi"
+    , depth == 0 = Just (ifToks, acc [], rest)
+    | name == "fi" = goElse ifToks (depth - 1) (acc . (t:)) rest
+    | name `Set.member` conditionals =
+        goElse ifToks (depth + 1) (acc . (t:)) rest
+  goElse ifToks depth acc (t : rest) = goElse ifToks depth (acc . (t:)) rest
 
 -- | Handle a LaTeX3 expandable evaluator (@\inteval@, @\fpeval@,
 -- ...): grab the braced argument (macros in it are expanded as it
@@ -1328,10 +1429,7 @@ bracedUrl = braced' (retokenizeComment >> anyTok)
 retokenizeComment :: PandocMonad m => LP m ()
 retokenizeComment = (do
   Tok pos Comment txt <- satisfyTok isCommentTok
-  let updPos (Tok pos' toktype' txt') =
-        Tok (incSourceColumn (incSourceLine pos' (sourceLine pos - 1))
-             (sourceColumn pos)) toktype' txt'
-  let newtoks = map updPos $ tokenize pos $ T.tail txt
+  let newtoks = tokenize (incSourceColumn pos 1) $ T.tail txt
   TokStream macrosExpanded ts <- getInput
   setInput $ TokStream macrosExpanded ((Tok pos Symbol "%" : newtoks) ++ ts))
     <|> return ()
@@ -1550,23 +1648,16 @@ ignore raw = do
 
 withRaw :: PandocMonad m => LP m a -> LP m (a, [Tok])
 withRaw parser = do
-  rawTokensMap <- sRawTokens <$> getState
-  let key = case IntMap.lookupMax rawTokensMap of
-               Nothing     -> 0
-               Just (n,_)  -> n + 1
-  -- insert empty list at key
-  updateState $ \st -> st{ sRawTokens =
-                             IntMap.insert key [] $ sRawTokens st }
+  startCount <- sRawTokenCount <$> getState
+  updateState $ \st -> st{ sRawScopes = sRawScopes st + 1 }
   result <- parser
-  mbRevToks <- IntMap.lookup key . sRawTokens <$> getState
-  raw <- case mbRevToks of
-           Just revtoks -> do
-             updateState $ \st -> st{ sRawTokens =
-                                        IntMap.delete key $ sRawTokens st}
-             return $ reverse revtoks
-           Nothing      ->
-             throwError $ PandocShouldNeverHappenError $
-                "sRawTokens has nothing at key " <> T.pack (show key)
+  st <- getState
+  let raw = reverse $ take (sRawTokenCount st - startCount) (sRawTokens st)
+  setState $ if sRawScopes st <= 1
+                then st{ sRawScopes = 0
+                       , sRawTokens = []
+                       , sRawTokenCount = 0 }
+                else st{ sRawScopes = sRawScopes st - 1 }
   return (result, raw)
 
 keyval :: PandocMonad m => LP m (Text, Text)
