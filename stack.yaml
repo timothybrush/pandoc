@@ -55,7 +55,7 @@ extra-deps:
 - crypton-2.2.6
 - crypton-x509-1.10.1
 - crypton-x509-validation-1.10.1
-- crypton-x509-store-1.10.10
+- crypton-x509-store-1.10.0
 - crypton-asn1-encoding-0.10.0
 - crypton-asn1-types-0.4.1
 - crypton-asn1-parse-0.10.0
