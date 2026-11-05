@@ -47,7 +47,11 @@ extra-deps:
 - citeproc-0.14.1.1
 - texmath-0.13.3.3
 - crypton-2.2.6
+- crypton-x509-1.10.1
 - crypton-x509-validation-1.10.1
+- crypton-asn1-encoding-0.10.0
+- crypton-asn1-types-0.4.1
+- time-hourglass-0.3.0
 - ram-0.22.1
 - git: https://github.com/jgm/commonmark-hs.git
   commit: 89b2686bbc77aba333a79790e39cb08b90c1d75d
