@@ -44,8 +44,11 @@ extra-deps:
 - scientific-0.3.9.0
 - text-iso8601-0.1.1.2
 - gridtables-0.1.1.1
-- citeproc-0.14.1.1
-- texmath-0.13.3.3
+- git: https://github.com/jgm/citeproc.git
+  commit: e3e4b835ca2a3548a1ef0118266a736d345b10bd
+- git: https://github.com/jgm/texmath.git
+  commit: b0d74f4cbde104a71e6d40270711178482077f38
+- emojis-0.1.6
 - git: https://github.com/jgm/commonmark-hs.git
   commit: 89b2686bbc77aba333a79790e39cb08b90c1d75d
   subdirs: [commonmark]
@@ -65,9 +68,6 @@ extra-deps:
 - ram-0.22.1
 # needed because not yet in nixpkgs:
 - pandoc-types-1.23.1.2
-# needed because not yet in nixpkgs:
-- git: https://github.com/jgm/emojis.git
-  commit: eb7776592b48e6f7137c63bcecd14d20445648f5
 ghc-options:
    "$locals": -fhide-source-paths -Wno-missing-home-modules
 resolver: lts-24.51
