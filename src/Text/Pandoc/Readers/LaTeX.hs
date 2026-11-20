@@ -354,6 +354,53 @@ inlineCommand' = try $ do
   commandMap <- envInlineCommands <$> askEnv
   lookupListDefault raw names commandMap
 
+-- | Skip the arguments of a plain TeX font setup command, or keep the
+-- command as raw LaTeX if @raw_tex@ is enabled.
+fontSetup :: PandocMonad m => Text -> LP m () -> LP m Inlines
+fontSetup name args = do
+  (_, toks) <- withRaw args
+  parseRaw <- extensionEnabled Ext_raw_tex <$> getOption readerExtensions
+  return $ if parseRaw
+              then rawInline "latex" ("\\" <> name <> untokenize toks)
+              else mempty
+
+-- | Parse the rest of a font declaration, @\\font\\name=file@, which
+-- may be followed by @at@ a size or @scaled@ a factor.
+fontDeclaration :: PandocMonad m => LP m ()
+fontDeclaration = do
+  sp
+  void anyControlSeq
+  sp
+  void $ optional (symbol '=')
+  sp
+  skipMany1 (satisfyTok isFileNameTok)
+  void $ optional $ try $ do
+    sp
+    Tok _ Word keyword <- satisfyTok isWordTok
+    guard $ keyword == "at" || keyword == "scaled"
+    sp
+    magnification <|> skipMany1 (satisfyTok isSizeTok)
+ where
+  isFileNameTok (Tok _ toktype t) =
+    toktype == Word ||
+    (toktype == Symbol && t /= "{" && t /= "}" && t /= "\\")
+  isSizeTok (Tok _ toktype t) =
+    toktype == Word || (toktype == Symbol && t == ".")
+  magnification =
+    (controlSeq "magstep" *> sp *> void (satisfyTok isWordTok))
+    <|> void (controlSeq "magstephalf")
+
+-- | Parse the rest of a math family assignment such as
+-- @\\textfont\\Bbbfam=\\tenBbb@ or @\\scriptfont1=\\seveni@.
+familyFont :: PandocMonad m => LP m ()
+familyFont = do
+  sp
+  void anyControlSeq <|> void (satisfyTok isWordTok)
+  sp
+  void $ optional (symbol '=')
+  sp
+  void anyControlSeq
+
 tok :: PandocMonad m => LP m Inlines
 tok = tokWith inline
 
@@ -410,6 +457,12 @@ inlineCommands = M.unions
     , ("mbox", rawInlineOr "mbox" $ processHBox <$> tok)
     , ("hbox", rawInlineOr "hbox" $ processHBox <$> tok)
     , ("vbox", rawInlineOr "vbox" tok)
+    -- plain TeX font setup, which produces no output
+    , ("font", fontSetup "font" fontDeclaration)
+    , ("newfam", fontSetup "newfam" (void (sp *> anyControlSeq)))
+    , ("textfont", fontSetup "textfont" familyFont)
+    , ("scriptfont", fontSetup "scriptfont" familyFont)
+    , ("scriptscriptfont", fontSetup "scriptscriptfont" familyFont)
     , ("lettrine", rawInlineOr "lettrine" lettrine)
     , ("(", withMathMode
         (mathInline . untokenize <$> manyTill anyTok (controlSeq ")")))
@@ -1061,7 +1114,7 @@ section (ident, classes, kvs) lvl = do
   contents <- grouped inline
   lab <- option ident $
           try (spaces >> controlSeq "label"
-               >> spaces >> untokenize <$> braced)
+               >> skipopts >> spaces >> untokenize <$> braced)
   when (lvl == 0) $
     updateState $ \st -> st{ sHasChapters = True }
   unless ("unnumbered" `elem` classes) $ do
@@ -1135,8 +1188,34 @@ parbox = try $ do
   updateState $ \st -> st{ sInTableCell = oldInTableCell }
   return res
 
+-- | A package's definition command, such as @\\newcolumntype@, which
+-- produces no output.  With @raw_tex@ it is kept as raw LaTeX.
+packageDefinition :: PandocMonad m => Text -> LP m () -> LP m Blocks
+packageDefinition name args = do
+  (_, toks) <- withRaw args
+  parseRaw <- extensionEnabled Ext_raw_tex <$> getOption readerExtensions
+  return $ if parseRaw
+              then rawBlock "latex" ("\\" <> name <> untokenize toks)
+              else mempty
+
+-- | The arguments of tcolorbox's @\\newtcolorbox@ and the commands like it:
+-- @[init options]{name}[number of arguments][default]{options}@.
+tcolorboxDefinition :: PandocMonad m => LP m ()
+tcolorboxDefinition = skipopts *> definitionArg *> skipopts *> definitionArg
+
+definitionArg :: PandocMonad m => LP m ()
+definitionArg = void (spaces *> braced)
+
 blockCommands :: PandocMonad m => M.Map Text (LP m Blocks)
-blockCommands = M.fromList
+blockCommands = M.fromList $
+   [ ("newcolumntype", packageDefinition "newcolumntype" $
+        definitionArg *> skipopts *> definitionArg)
+   ] ++
+   [ (name, packageDefinition name tcolorboxDefinition)
+   | name <- [ "newtcolorbox", "renewtcolorbox", "newtcbox", "renewtcbox"
+             , "newtcblisting", "renewtcblisting"
+             , "newtcbinputlisting", "renewtcbinputlisting" ]
+   ] ++
    [ ("par", mempty <$ skipopts)
    , ("addtocounter", addtocounter)
    , ("parbox",  parbox)
@@ -1146,7 +1225,10 @@ blockCommands = M.fromList
    , ("subtitle", mempty <$ (skipopts *> tok >>= addMeta "subtitle"))
    , ("author", mempty <$ (skipopts *> authors))
    -- -- in letter class, temp. store address & sig as title, author
-   , ("address", mempty <$ (skipopts *> tok >>= addMeta "address"))
+   -- \and may separate affiliations in an address:
+   , ("address", mempty <$ (skipopts *>
+        tokWith (inline <|> (linebreak <$ controlSeq "and"))
+          >>= addMeta "address"))
    , ("signature", mempty <$ (skipopts *> authors))
    , ("date", mempty <$ (skipopts *> tok >>= addMeta "date"))
    , ("newtheorem", newtheorem)

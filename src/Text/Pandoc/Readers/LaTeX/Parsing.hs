@@ -1645,7 +1645,10 @@ dimenarg :: PandocMonad m => LP m Text
 dimenarg = try $ do
   optional sp
   ch  <- option False $ True <$ symbol '='
-  minus <- option "" $ "-" <$ symbol '-'
+  -- as in TeX, any number of signs, each may be followed by spaces:
+  signs <- many $ try $ optional sp *> (symbol '-' <|> symbol '+')
+  unless (null signs) $ optional sp
+  let minus = if odd (length [() | Tok _ _ "-" <- signs]) then "-" else ""
   s1 <- option ""
         (do Tok _ _ s1 <- satisfyTok isWordTok
             guard (case T.uncons s1 of
@@ -1696,7 +1699,7 @@ keyval = try $ do
            symbol '='
            sp
            (untokenize <$> braced) <|>
-             (mconcat <$> many1 (
+             (mconcat <$> many (
                  (untokenize . snd <$> withRaw braced)
                  <|>
                  (untokenize <$> many1
@@ -1708,12 +1711,12 @@ keyval = try $ do
                                 Tok _ Symbol "}" -> False
                                 _                -> True)))))
   sp
-  optional (symbol ',')
-  sp
+  skipMany (symbol ',' *> sp) -- empty entries, as in [a,,b]
   return (key, T.strip val)
 
 keyvals :: PandocMonad m => LP m [(Text, Text)]
-keyvals = try $ symbol '[' >> manyTill keyval (symbol ']') <* sp
+keyvals = try $ symbol '[' >> skipMany (try (sp *> symbol ',')) >>
+  manyTill keyval (symbol ']') <* sp
 
 verbEnv :: PandocMonad m => Text -> LP m Text
 verbEnv name = withVerbatimMode $ do
@@ -1751,7 +1754,10 @@ getRawCommand name txt = do
   (_, rawargs) <- withRaw $
       case name of
            "write" -> do
-             void $ many $ satisfyTok isDigitTok -- digits
+             -- the stream: a number, or a register such as \@auxout
+             optional sp
+             void anyControlSeq <|> void (many $ satisfyTok isDigitTok)
+             optional sp
              void braced
            "titleformat" -> do
              void braced
@@ -1859,6 +1865,7 @@ getNextNumber getCurrentNum = do
 label :: PandocMonad m => LP m ()
 label = do
   controlSeq "label"
+  skipopts -- cleveref's \label[type]{key}
   t <- braced
   updateState $ \st -> st{ sLastLabel = Just $ untokenize t }
 
