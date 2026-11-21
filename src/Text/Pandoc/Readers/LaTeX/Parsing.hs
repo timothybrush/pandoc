@@ -646,7 +646,9 @@ doMacros' n inp =
         -> handleMacros n spos name ts <|> return inp
      Tok spos (CtrlSeq "end") _ : Tok _ Symbol "{" :
       Tok _ Word name : Tok _ Symbol "}" : ts
-        -> handleMacros n spos ("end" <> name) ts <|> return inp
+        -> handleMacros n spos ("end" <> name) ts
+           <|> endOfMacroEnvironment name ts
+           <|> return inp
      Tok _ (CtrlSeq "expandafter") _ : t : ts
         -> combineTok t <$> doMacros' n ts
      Tok spos (CtrlSeq name) _ : ts
@@ -757,6 +759,15 @@ doMacros' n inp =
         Tok spos (CtrlSeq x) (txt <> " ") : acc
     addTok _ _ spos t acc = setpos spos t : acc
 
+    -- \begin{name} expands the macro \name, if there is one. As in
+    -- LaTeX, where \end{name} calls \endname only if it is defined,
+    -- the \end{name} of such an environment is dropped when there is
+    -- no macro \endname (e.g. after \def\proof{...}):
+    endOfMacroEnvironment name ts = do
+      (macros :| _ ) <- sMacros <$> getState
+      guard $ M.member name macros && not (M.member ("end" <> name) macros)
+      doMacros' n ts
+
     handleMacros n' spos name ts = do
       when (n' > 20)  -- detect macro expansion loops
         $ throwError $ PandocMacroLoop name
@@ -836,6 +847,8 @@ trySpecialMacro "xspace" ts = do
     Tok pos Word t : _
       | startsWithAlphaNum t -> return $ Tok pos Spaces " " : ts'
     _ -> return ts'
+-- \csname name\endcsname: turn the name into a control sequence:
+trySpecialMacro "csname" ts = handleIf csnameParser ts
 trySpecialMacro "iftrue" ts = doIf True ts
 trySpecialMacro "iffalse" ts = doIf False ts
 trySpecialMacro "ifmmode" ts = do
@@ -936,6 +949,28 @@ useNameParser = do
   name <- untokenize <$> withVerbatimMode (spaces *> braced)
   TokStream _ rest <- getInput
   return $ Tok pos (CtrlSeq name) ("\\" <> name <> " ") : rest
+
+-- | Parser for the tokens after @\\csname@, up to @\\endcsname@.
+-- The tokens are not expanded, so the name must be made of
+-- characters only (as in @\\csname val-1\\endcsname@).  The
+-- resulting token keeps the original text, so raw LaTeX output is
+-- unchanged.
+csnameParser :: PandocMonad m => LP m [Tok]
+csnameParser = withVerbatimMode $ do
+  pos <- getPosition
+  (nameToks, Tok _ _ end) <-
+    manyUntil (satisfyTok isNameTok) (controlSeq "endcsname")
+  let name = untokenize nameToks
+  guard $ not (T.null name)
+  TokStream _ rest <- getInput
+  return $ Tok pos (CtrlSeq name) ("\\csname " <> name <> end) : rest
+ where
+  isNameTok (Tok _ toktype t) =
+    case toktype of
+      Word   -> True
+      Spaces -> True
+      Symbol -> t /= "{" && t /= "}"
+      _      -> False
 
 -- | Parser for the arguments of @\\ExpandArgs{spec}\\cmd{arg1}...@:
 -- transform each argument as described by the corresponding letter
@@ -1699,6 +1734,23 @@ dimenarg = try $ do
     ]
   return $ T.pack ['=' | ch] <> minus <> s
 
+-- | The amount of a skip: a dimension, or a length register such as
+-- @\\baselineskip@, optionally with a sign and a factor.
+skiparg :: PandocMonad m => LP m ()
+skiparg = void (try dimenRegister) <|> void dimenarg
+  where
+    dimenRegister = do
+      optional sp
+      optional (symbol '=')
+      optional sp
+      optional (symbol '-')
+      skipMany (satisfyTok isFactorTok)
+      anyControlSeq
+    -- the digits and decimal point of a factor such as 0.5 or .5
+    isFactorTok (Tok _ Word t) = T.all isDigit t
+    isFactorTok (Tok _ Symbol ".") = True
+    isFactorTok _ = False
+
 ignore :: (Monoid a, PandocMonad m) => Text -> ParsecT s u m a
 ignore raw = do
   pos <- getPosition
@@ -1728,7 +1780,10 @@ keyval = try $ do
   val <- option mempty $ do
            symbol '='
            sp
-           (untokenize <$> braced) <|>
+           -- as with the keyval package, the braces are stripped only
+           -- if they enclose the whole value (unlike, e.g., in
+           -- caption={Text}\label{lst:a}):
+           try (untokenize <$> braced <* lookAhead valueEnd) <|>
              (mconcat <$> many (
                  (untokenize . snd <$> withRaw braced)
                  <|>
@@ -1743,6 +1798,8 @@ keyval = try $ do
   sp
   skipMany (symbol ',' *> sp) -- empty entries, as in [a,,b]
   return (key, T.strip val)
+ where
+  valueEnd = sp *> (symbol ',' <|> symbol ']')
 
 keyvals :: PandocMonad m => LP m [(Text, Text)]
 keyvals = try $ sp >> symbol '[' >> skipMany (try (sp *> symbol ',')) >>
@@ -1788,10 +1845,15 @@ getRawCommand name txt = do
              optional sp
              void anyControlSeq <|> void (many $ satisfyTok isDigitTok)
              void braced
-           "titleformat" -> do
-             void braced
-             skipopts
-             void $ count 4 braced
+           -- titlesec: \titleformat*{cmd}{format} or
+           -- \titleformat{cmd}[shape]{format}{label}{sep}{before}[after]
+           "titleformat"
+             | "*" `T.isSuffixOf` txt -> void $ count 2 braced
+             | otherwise -> do
+                 void braced
+                 skipopts
+                 void $ count 4 braced
+                 skipopts
            "def" ->
              void $ manyTill anyTok braced
            "vadjust" ->
@@ -1801,7 +1863,7 @@ getRawCommand name txt = do
              | name `elem` ["hfil", "hfill", "vfil", "vfill",
                             "hfilneg", "vfilneg"] -> return ()
              | name `elem` ["hskip", "vskip", "mskip"] -> do
-                 dimenarg
+                 skiparg
                  skipMany $ try $ do
                    sp
                    satisfyTok $

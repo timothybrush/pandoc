@@ -16,6 +16,7 @@ import Control.Applicative ((<|>), optional)
 import Control.Monad (guard, mzero)
 import Data.Char (chr, isLetter, ord)
 import qualified Data.Map as M
+import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -69,6 +70,7 @@ macroDefCommands = Set.fromList
   [ "global"  -- see checkGlobal
   , "let", "edef", "xdef", "def", "gdef", "newif"
   , "newcommand", "renewcommand", "providecommand"
+  , "algnewcommand", "algrenewcommand"
   , "DeclareMathOperator", "DeclareRobustCommand"
   , "NewDocumentCommand", "RenewDocumentCommand"
   , "ProvideDocumentCommand", "DeclareDocumentCommand"
@@ -150,17 +152,22 @@ letmacro = do
 
 checkGlobal :: PandocMonad m => LP m [(Text, Macro)] -> LP m [(Text, Macro)]
 checkGlobal p =
-  (controlSeq "global" *>
+  try (controlSeq "global" *>
       (map (\(n, Macro _ expand arg optarg contents) ->
                 (n, Macro GlobalScope expand arg optarg contents)) <$> p))
    <|> p
+
+-- | Parse the name in @\def\name@ and similar definitions, which may
+-- follow on the next line, as in TeX.
+macroName :: PandocMonad m => LP m Tok
+macroName = sp *> anyControlSeq
 
 edefmacro :: PandocMonad m => LP m [(Text, Macro)]
 edefmacro = do
   scope <- (GroupScope <$ controlSeq "edef")
        <|> (GlobalScope <$ controlSeq "xdef")
   (name, contents) <- withVerbatimMode $ do
-    Tok _ (CtrlSeq name) _ <- anyControlSeq
+    Tok _ (CtrlSeq name) _ <- macroName
     -- we first parse in verbatim mode, and then expand macros,
     -- because we don't want \let\foo\bar to turn into
     -- \let\foo hello if we have previously \def\bar{hello}
@@ -177,7 +184,7 @@ defmacro = do
   scope <- (GroupScope <$ controlSeq "def")
        <|> (GlobalScope <$ controlSeq "gdef")
   withVerbatimMode $ do
-    Tok _ (CtrlSeq name) _ <- anyControlSeq
+    Tok _ (CtrlSeq name) _ <- macroName
     argspecs <- many (argspecArg <|> argspecPattern)
     contents <- bracedOrToken
     return [(name, Macro scope ExpandWhenUsed argspecs Nothing contents)]
@@ -229,11 +236,16 @@ argspecPattern =
 
 newcommand :: PandocMonad m => LP m [(Text, Macro)]
 newcommand = do
-  Tok pos (CtrlSeq mtype) _ <- controlSeq "newcommand" <|>
+  Tok pos (CtrlSeq mtype') _ <- controlSeq "newcommand" <|>
                              controlSeq "renewcommand" <|>
                              controlSeq "providecommand" <|>
+                             controlSeq "algnewcommand" <|>
+                             controlSeq "algrenewcommand" <|>
                              controlSeq "DeclareMathOperator" <|>
                              controlSeq "DeclareRobustCommand"
+  -- algpseudocode's \algnewcommand and \algrenewcommand are
+  -- \newcommand and \renewcommand:
+  let mtype = fromMaybe mtype' (T.stripPrefix "alg" mtype')
   withVerbatimMode $ do
     Tok _ (CtrlSeq name) txt <- do
       optional (symbol '*')
