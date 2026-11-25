@@ -410,6 +410,9 @@ header when requesting a document from a URL:
     environment variable).  If that directory does not exist and
     `$HOME/.pandoc` exists, it will be used (for backwards compatibility).
     On Windows the default user data directory is `%APPDATA%\pandoc`.
+    If the `PANDOC_USER_DATA_DIR` environment variable is set, its
+    value is used as the default user data directory instead; if it
+    is set to the empty string, no user data directory is used.
     You can find the default user data directory on your system by
     looking at the output of `pandoc --version`.
     Data files placed in this directory (for example, `reference.odt`,
@@ -8191,6 +8194,21 @@ set at startup. For full documentation, see the [pandoc-lua] man page.
 
 [lua standalone]: https://www.lua.org/manual/5.4/manual.html#7
 [pandoc-lua]: https://github.com/jgm/pandoc/blob/master/doc/pandoc-lua.md
+
+# Environment variables
+
+`PANDOC_USER_DATA_DIR`
+
+  : specifies the default user data directory (overridable with
+    `--data-dir` on the command line). If it is set to an empty
+    string, no user data directory will be used.
+
+`PANDOC_DATA_DIRS`
+
+  : specifies a list of directories (separated by `:`, or `;` on
+    Windows) that will be searched (in order) for data files not
+    found in the user data directory, before pandoc falls back on its
+    default data files. Non-absolute paths are ignored.
 
 # A note on security
 
